@@ -23,6 +23,13 @@
       @new-board="handleNewBoard"
     />
 
+    <ShareDialogs
+      v-model:visibleShare="showShareDialog"
+      v-model:visiblePassword="showPasswordDialog"
+      v-model:passwordError="passwordErrorMsg"
+      @save-settings="saveShareSettings"
+      @verify-password="verifyAndLoad"
+    />
     <div class="main-content">
       <!-- 2. 画布区域 -->
       <div class="canvas-wrapper" ref="canvasWrapperRef">
@@ -55,6 +62,8 @@ import { useSocket } from '../composables/useSocket'
 import WhiteboardToolbar from '../components/WhiteboardToolbar.vue'
 import PropertySidebar from '../components/PropertySidebar.vue'
 import { useRoute, useRouter } from 'vue-router'
+import ShareDialogs from '../components/ShareDialogs.vue'
+import { updateShareSettings, getBoard } from '../api/board'
 
 // --- 初始化 Store ---
 const store = useBoardStore()
@@ -85,6 +94,9 @@ const { socket, isConnected, connect, joinRoom } = useSocket()
 
 // --- 本地状态 (仅保留与 DOM 相关的) ---
 const canvasWrapperRef = ref(null)
+const showShareDialog = ref(false)
+const showPasswordDialog = ref(false)
+const passwordErrorMsg = ref('')
 
 // --- 逻辑桥接 (连接 Store 和 Canvas) ---
 
@@ -108,8 +120,44 @@ const handleManualSave = async () => {
   store.setStatus('已保存到云端')
 }
 
-const handleLoad = () => {
-  store.load((data) => loadFromJSON(data))
+// 加载逻辑，接收密码参数
+const handleLoad = async (password = '') => {
+  store.isLoading = true
+  // 每次尝试加载前，先清空错误（如果是首次加载）
+  if (!password) passwordErrorMsg.value = ''
+
+  try {
+    const res = await getBoard(store.boardId, password)
+
+    if (res.code === 0) {
+      if (res.data) loadFromJSON(res.data)
+      showPasswordDialog.value = false
+      passwordErrorMsg.value = '' // 成功后清空错误
+    } else if (res.code === 403) {
+      if (res.error === 'password_required') {
+        showPasswordDialog.value = true
+        store.setStatus('需要密码')
+
+        // 如果是用户手动输入密码后返回 403，说明密码错了
+        if (password) {
+          passwordErrorMsg.value = '密码错误，请重试'
+        }
+      } else if (res.error === 'expired') {
+        alert('此白板链接已过期')
+        router.push('/')
+      }
+    }
+  } catch (err) {
+    console.error('加载白板数据失败:', err)
+    store.setStatus('加载失败，请检查网络')
+  } finally {
+    store.isLoading = false
+  }
+}
+
+// 验证密码的回调
+const verifyAndLoad = (password) => {
+  handleLoad(password)
 }
 
 // 工具切换
@@ -141,15 +189,65 @@ const syncAttribute = (key, value) => {
   }
 }
 
-const copyLink = async () => {
-  // ... 复制链接逻辑 ...
-  const url = window.location.href
-  try {
-    await navigator.clipboard.writeText(url)
-    store.setStatus('🔗 链接已复制')
-  } catch (err) {
-    store.setStatus('❌ 复制失败', err)
+const copyLink = () => {
+  showShareDialog.value = true
+}
+
+// 保存分享设置的回调
+const copyToClipboard = async (text) => {
+  // 1. 优先尝试标准 API (需要 HTTPS 或 localhost)
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text)
+    return
   }
+
+  // 2. 降级方案：使用传统的 document.execCommand (兼容 HTTP)
+  // 创建一个隐藏的输入框来选中文本
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+
+  // 防止在移动端唤起键盘
+  textArea.style.position = 'fixed'
+  textArea.style.left = '-9999px'
+  textArea.setAttribute('readonly', '')
+
+  document.body.appendChild(textArea)
+  textArea.focus()
+  textArea.select()
+
+  try {
+    const successful = document.execCommand('copy')
+    if (!successful) throw new Error('Copy failed')
+  } catch (err) {
+    throw new Error('浏览器不支持自动复制，' + err)
+  } finally {
+    document.body.removeChild(textArea)
+  }
+}
+
+// 保存分享设置的回调
+const saveShareSettings = async (settings) => {
+  // 1. 先尝试保存到后端
+  try {
+    await updateShareSettings(store.boardId, settings)
+  } catch (err) {
+    console.error(err)
+    store.setStatus('保存设置失败，请检查网络')
+    return // 如果后端存不进去，就直接停止
+  }
+
+  // 2. 后端保存成功后，再尝试复制链接
+  try {
+    const url = window.location.href
+    await copyToClipboard(url)
+    store.setStatus('设置已保存，链接已复制')
+  } catch (err) {
+    console.warn('复制失败:', err)
+    // 即使复制失败，也要告诉用户设置是成功的
+    store.setStatus('设置已保存 (请手动复制链接)')
+  }
+
+  showShareDialog.value = false
 }
 
 const handleNewBoard = () => {
