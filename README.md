@@ -5,9 +5,9 @@
 ## 📺 视频演示
 
 <div align="center">
-  <video src="asset/vedio.mp4" controls width="100%" autoplay loop muted></video>
+  <video src="https://github.com/jianjuehai/MVP-for-an-online-collaborative-whiteboard/issues/1#issue-3689704565" controls width="100%" autoplay loop muted></video>
   <br/>
-  <small>如果视频无法播放，请<a href="asset/vedio.mp4">点击此处下载观看</a></small>
+  <small>如果视频无法播放，请<a href="https://github.com/jianjuehai/MVP-for-an-online-collaborative-whiteboard/issues/1#issue-3689704565">点击此处下载观看</a></small>
 </div>
 
 ## ✨ 功能特性
