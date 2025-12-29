@@ -10,23 +10,29 @@ const path = require('path')
 const fs = require('fs')
 const serve = require('koa-static')
 
+// --- 引入数据库模块 ---
+const { query } = require('./db')
+
 const app = new Koa()
 const router = new Router()
 
 // 模拟数据库 (Key: boardId, Value: JSON Data)
-const db = new Map()
+// const db = new Map()
+// Key: username, Value: { id, username, password }
+// const users = new Map()
 
 // 辅助函数：检查白板是否可用（过期或不存在）
 const checkBoardAccess = (board, password) => {
   if (!board) return { allowed: false, reason: 'not_found' }
 
-  // 检查过期
-  if (board.meta?.expiresAt && Date.now() > board.meta.expiresAt) {
+  // 修正 1: 数据库字段是 expires_at (下划线)，不是 meta.expiresAt
+  // 注意：数据库取出的 bigint 可能是字符串或数字，比较时最好转一下，但在 JS 中通常直接比也没问题
+  if (board.expires_at && Date.now() > Number(board.expires_at)) {
     return { allowed: false, reason: 'expired' }
   }
 
-  // 检查密码
-  if (board.meta?.password && board.meta.password !== password) {
+  // 修正 2: 数据库字段是 password，不是 meta.password
+  if (board.password && board.password !== password) {
     return { allowed: false, reason: 'password_required' }
   }
 
@@ -46,6 +52,22 @@ if (fs.existsSync(staticPath)) {
   app.use(serve(staticPath))
 }
 
+// --- 中间件：解析 Token (但不强制拦截，因为未登录用户也能访问白板) ---
+const authMiddleware = async (ctx, next) => {
+  const token = ctx.headers['authorization']?.replace('Bearer ', '')
+
+  if (token) {
+    try {
+      // 解码 Token，获取用户信息 { id, username, ... }
+      const decoded = jwt.verify(token, JWT_SECRET)
+      ctx.state.user = decoded
+    } catch (err) {
+      // Token 无效或过期，这里选择忽略，视为游客
+      console.log('Token invalid:', err.message)
+    }
+  }
+  await next()
+}
 // --- API 定义 ---
 
 // 1. 获取白板数据
@@ -53,72 +75,263 @@ router.get('/api/board/:id', async (ctx) => {
   const { id } = ctx.params
   const { password } = ctx.query // 从查询参数获取密码
 
-  const board = db.get(id)
+  try {
+    // SQL 查询
+    const rows = await query('SELECT * FROM boards WHERE id = ?', [id])
+    const board = rows[0]
 
-  // 如果是新白板（内存里没有），直接允许
-  if (!board) {
-    ctx.body = { code: 0, data: null, message: 'New board' }
-    return
+    // 如果数据库没记录，视为新白板
+    if (!board) {
+      ctx.body = { code: 0, data: null, message: 'New board' }
+      return
+    }
+
+    const access = checkBoardAccess(board, password)
+
+    if (!access.allowed) {
+      ctx.body = { code: 403, error: access.reason, message: 'Access denied' }
+      return
+    }
+
+    // 解析 JSON (数据库存的是字符串)
+    const boardData = board.data ? JSON.parse(board.data) : null
+    ctx.body = { code: 0, data: boardData }
+  } catch (err) {
+    console.error('DB Error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
   }
-
-  const access = checkBoardAccess(board, password)
-
-  if (!access.allowed) {
-    // 返回特定的错误码，前端据此显示密码输入框或过期提示
-    ctx.body = { code: 403, error: access.reason, message: 'Access denied' }
-    return
-  }
-
-  ctx.body = { code: 0, data: board.data }
 })
 
 // 2. 保存白板数据
-router.post('/api/board/:id', async (ctx) => {
+router.post('/api/board/:id', authMiddleware, async (ctx) => {
+  // 如果没有用户信息，直接拒绝
+  if (!ctx.state.user) {
+    ctx.status = 401
+    ctx.body = { code: 401, message: '请登录后保存' }
+    return
+  }
+
   const { id } = ctx.params
-  const boardData = ctx.request.body // 前端传来的 canvas JSON
+  const boardData = ctx.request.body
 
-  // 获取旧数据以保留 meta 信息
-  const existing = db.get(id) || { meta: {} }
+  // 获取当前登录用户的 ID (如果没有登录，则是 null)
+  const userId = ctx.state.user ? ctx.state.user.id : null
 
-  db.set(id, {
-    ...existing,
-    data: boardData,
-  })
+  try {
+    const dataStr = JSON.stringify(boardData)
+    const now = new Date()
 
-  ctx.body = { code: 0, message: 'Saved successfully' }
+    // SQL 修改：
+    // 1. 插入列增加了 owner_id
+    // 2. VALUES 增加了 ?
+    // 3. ON DUPLICATE KEY UPDATE 不更新 owner_id (防止别人保存时篡改所有者)
+    const sql = `
+      INSERT INTO boards (id, data, created_at, updated_at, owner_id) 
+      VALUES (?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE 
+        data = VALUES(data), 
+        updated_at = VALUES(updated_at)
+        -- 注意：这里不更新 owner_id，只有第一次创建时才写入
+    `
+
+    // 参数数组对应：id, data, created_at, updated_at, owner_id
+    await query(sql, [id, dataStr, now, now, userId])
+
+    ctx.body = { code: 0, message: 'Saved successfully' }
+  } catch (err) {
+    console.error('DB Error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
+  }
 })
 
 // 3. 设置分享选项 (密码、有效期)
-router.post('/api/board/:id/share', async (ctx) => {
-  const { id } = ctx.params
-  const { password, expiresIn } = ctx.request.body // expiresIn 单位：小时
-
-  const existing = db.get(id) || { data: null }
-
-  const meta = {
-    password: password || null, // 空字符串视为无密码
-    expiresAt: expiresIn ? Date.now() + expiresIn * 3600 * 1000 : null,
+router.post('/api/board/:id/share', authMiddleware, async (ctx) => {
+  if (!ctx.state.user) {
+    ctx.status = 401
+    ctx.body = { code: 401, message: '请登录后设置' }
+    return
   }
 
-  db.set(id, { ...existing, meta })
-
-  ctx.body = { code: 0, message: 'Share settings updated' }
-})
-
-// 4. 验证密码接口 (用于前端输入密码后的校验)
-router.post('/api/board/:id/verify', async (ctx) => {
   const { id } = ctx.params
-  const { password } = ctx.request.body
+  const { password, expiresIn } = ctx.request.body
 
-  const board = db.get(id)
-  const access = checkBoardAccess(board, password)
+  const expiresAt = expiresIn ? Date.now() + expiresIn * 3600 * 1000 : null
+  const pwd = password || null
+  const now = new Date()
 
-  if (access.allowed) {
-    ctx.body = { code: 0, token: 'ok' } // 简单返回成功
-  } else {
-    ctx.body = { code: 403, error: access.reason }
+  try {
+    // SQL: 有则更新设置，无则插入
+    const sql = `
+      INSERT INTO boards (id, password, expires_at, created_at, updated_at) 
+      VALUES (?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE 
+        password = VALUES(password), 
+        expires_at = VALUES(expires_at),
+        updated_at = VALUES(updated_at)
+    `
+    await query(sql, [id, pwd, expiresAt, now, now])
+
+    ctx.body = { code: 0, message: 'Share settings updated' }
+  } catch (err) {
+    console.error('DB Error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
   }
 })
+// 4. 单独验证密码接口 (用于前端输入密码后的校验)
+// router.post('/api/board/:id/verify', async (ctx) => {
+//   const { id } = ctx.params
+//   const { password } = ctx.request.body
+
+//   const board = db.get(id)
+//   const access = checkBoardAccess(board, password)
+
+//   if (access.allowed) {
+//     ctx.body = { code: 0, token: 'ok' } // 简单返回成功
+//   } else {
+//     ctx.body = { code: 403, error: access.reason }
+//   }
+// })
+
+// 5. 删除白板
+router.delete('/api/board/:id', authMiddleware, async (ctx) => {
+  if (!ctx.state.user) {
+    ctx.status = 401
+    ctx.body = { code: 401, message: '请登录后操作' }
+    return
+  }
+
+  const { id } = ctx.params
+  const userId = ctx.state.user.id
+
+  try {
+    // 检查是否是所有者
+    const rows = await query('SELECT owner_id FROM boards WHERE id = ?', [id])
+    const board = rows[0]
+
+    if (!board) {
+      ctx.body = { code: 404, message: '画板不存在' }
+      return
+    }
+
+    if (board.owner_id !== userId) {
+      ctx.status = 403
+      ctx.body = { code: 403, message: '无权删除此画板' }
+      return
+    }
+
+    // 执行删除
+    await query('DELETE FROM boards WHERE id = ?', [id])
+    ctx.body = { code: 0, message: '删除成功' }
+  } catch (err) {
+    console.error('Delete board error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
+  }
+})
+
+// --- 用户认证相关 (注册、登录) ---
+
+const jwt = require('jsonwebtoken')
+const JWT_SECRET = 'your-secret-key' // 生产环境请放入环境变量
+
+// 注册
+router.post('/api/auth/register', async (ctx) => {
+  const { username, password } = ctx.request.body
+
+  // 1. 基础校验
+  if (!username || !password) {
+    ctx.body = { code: 400, message: '用户名和密码不能为空' }
+    return
+  }
+
+  // 2. 检查用户名是否存在 (内存模拟)
+  try {
+    // 1. 检查用户名是否存在
+    const existing = await query('SELECT id FROM users WHERE username = ?', [
+      username,
+    ])
+    if (existing.length > 0) {
+      ctx.body = { code: 400, message: '用户名已存在' }
+      return
+    }
+
+    // 2. 插入新用户
+    await query('INSERT INTO users (username, password) VALUES (?, ?)', [
+      username,
+      password,
+    ])
+
+    ctx.body = { code: 0, message: '注册成功' }
+  } catch (err) {
+    console.error('Register Error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
+  }
+})
+
+// 登录
+router.post('/api/auth/login', async (ctx) => {
+  const { username, password } = ctx.request.body
+
+  try {
+    // 1. 查找用户
+    const rows = await query('SELECT * FROM users WHERE username = ?', [
+      username,
+    ])
+    const user = rows[0]
+
+    // 2. 验证密码 (这里是明文比对，生产环境请用 bcrypt.compare)
+    if (user && user.password === password) {
+      const token = jwt.sign(
+        { id: user.id, username: user.username },
+        JWT_SECRET,
+        { expiresIn: '24h' },
+      )
+
+      ctx.body = {
+        code: 0,
+        data: {
+          token,
+          username: user.username,
+          id: user.id,
+        },
+        message: '登录成功',
+      }
+    } else {
+      ctx.body = { code: 401, message: '用户名或密码错误' }
+    }
+  } catch (err) {
+    console.error('Login Error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
+  }
+})
+
+// --- 获取当前用户的白板列表 ---
+router.get('/api/user/boards', authMiddleware, async (ctx) => {
+  const userId = ctx.state.user.id
+
+  try {
+    // 只查询必要的字段，不要把巨大的 data 查出来
+    const sql = `
+      SELECT id, created_at, updated_at 
+      FROM boards 
+      WHERE owner_id = ? 
+      ORDER BY updated_at DESC
+    `
+    const rows = await query(sql, [userId])
+
+    ctx.body = { code: 0, data: rows }
+  } catch (err) {
+    console.error('Get user boards error:', err)
+    ctx.status = 500
+    ctx.body = { code: 500, message: 'Server Error' }
+  }
+})
+
 // 挂载路由
 app.use(router.routes()).use(router.allowedMethods())
 

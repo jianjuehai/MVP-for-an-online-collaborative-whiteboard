@@ -1,12 +1,13 @@
 import { defineStore } from 'pinia'
 import { ref, reactive } from 'vue'
-import { saveBoard, getBoard } from '../api/board'
+import { saveBoard } from '../api/board'
+import { useUserStore } from './userStore'
 
 export const useBoardStore = defineStore('board', () => {
   // --- 状态 (State) ---
-  const boardId = ref(
-    new URLSearchParams(window.location.search).get('id') || 'default',
-  )
+  // 优先使用 URL 中的 id。如果没有，则判断：登录用户生成随机 ID，游客使用 'default'
+  const urlId = new URLSearchParams(window.location.search).get('id')
+  const boardId = ref(urlId || Math.random().toString(36).slice(2, 8))
   const currentTool = ref('select')
   const isSidebarOpen = ref(false)
   const isLoading = ref(false)
@@ -43,34 +44,26 @@ export const useBoardStore = defineStore('board', () => {
   const save = async (jsonData) => {
     if (!boardId.value) return
     isSaving.value = true
+
+    const userStore = useUserStore()
+
     try {
-      await saveBoard(boardId.value, jsonData)
-      console.log('[AutoSave] Success')
+      if (userStore.token) {
+        // 已登录：保存到云端
+        await saveBoard(boardId.value, jsonData)
+        console.log('[AutoSave] Cloud Success')
+      } else {
+        // 未登录：保存到本地 LocalStorage
+        // 使用 boardId 作为 key，实现不同房间数据隔离
+        const key = `board_data_${boardId.value}`
+        localStorage.setItem(key, JSON.stringify(jsonData))
+        console.log('[AutoSave] Local Success')
+      }
     } catch (err) {
       console.error('[AutoSave] Failed', err)
       setStatus('自动保存失败', true)
     } finally {
       isSaving.value = false
-    }
-  }
-
-  const load = async (loadCallback) => {
-    if (isLoading.value) return
-    try {
-      isLoading.value = true
-      const res = await getBoard(boardId.value)
-      const { data } = res.data
-      if (data) {
-        loadCallback(data) // 回调函数处理 Canvas 加载
-        setStatus('数据已同步')
-      } else {
-        setStatus('新白板已创建')
-      }
-    } catch (err) {
-      console.error(err)
-      setStatus('无法连接到服务器', true)
-    } finally {
-      isLoading.value = false
     }
   }
 
@@ -86,6 +79,5 @@ export const useBoardStore = defineStore('board', () => {
     setTool,
     setStatus,
     save,
-    load,
   }
 })

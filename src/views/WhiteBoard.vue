@@ -55,10 +55,11 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch, computed } from 'vue'
 import { useBoardStore } from '../stores/boardStore'
 import { useCanvas } from '../composables/useCanvas'
 import { useSocket } from '../composables/useSocket'
+import { useUserStore } from '../stores/userStore'
 import WhiteboardToolbar from '../components/WhiteboardToolbar.vue'
 import PropertySidebar from '../components/PropertySidebar.vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -69,6 +70,8 @@ import { updateShareSettings, getBoard } from '../api/board'
 const store = useBoardStore()
 const route = useRoute()
 const router = useRouter()
+const userStore = useUserStore()
+const isGuest = computed(() => !userStore.token)
 
 // --- Composables ---
 const {
@@ -127,6 +130,24 @@ const handleLoad = async (password = '') => {
   if (!password) passwordErrorMsg.value = ''
 
   try {
+    // --- 分支 A: 游客模式 (读本地) ---
+    if (isGuest.value) {
+      const localKey = `board_data_${store.boardId}`
+      const localDataStr = localStorage.getItem(localKey)
+
+      if (localDataStr) {
+        const json = JSON.parse(localDataStr)
+        loadFromJSON(json)
+        store.setStatus('已加载本地缓存')
+      } else {
+        clearCanvas()
+        store.setStatus('新本地白板')
+      }
+      store.isLoading = false
+      return // 游客逻辑结束
+    }
+
+    // --- 分支 B: 登录用户 (读云端 + 同步) ---
     const res = await getBoard(store.boardId, password)
 
     if (res.code === 0) {
@@ -136,10 +157,32 @@ const handleLoad = async (password = '') => {
 
       if (res.data) {
         loadFromJSON(res.data)
+        store.setStatus('云端数据已同步')
       } else {
-        // 如果是新白板（后端返回 null），必须手动清空画布
-        clearCanvas()
-        store.setStatus('新白板已创建')
+        // 2. 云端无数据 (新白板)：检查是否有本地缓存需要同步
+        // 场景：用户刚在游客模式画完，点击登录回来，此时云端是空的，但本地有刚才画的
+        const localKey = `board_data_${store.boardId}`
+        const localDataStr = localStorage.getItem(localKey)
+
+        if (localDataStr) {
+          console.log('检测到本地缓存，正在同步到云端...')
+          const json = JSON.parse(localDataStr)
+
+          // 加载到画布
+          loadFromJSON(json)
+
+          // 立即触发一次保存到云端
+          await store.save(json)
+
+          // 同步完成后清除本地缓存，避免混淆
+          localStorage.removeItem(localKey)
+
+          store.setStatus('本地数据已同步至云端')
+        } else {
+          // 真的全是新的
+          clearCanvas()
+          store.setStatus('新白板已创建')
+        }
       }
       showPasswordDialog.value = false
       passwordErrorMsg.value = '' // 成功后清空错误
@@ -354,7 +397,9 @@ onMounted(async () => {
   window.addEventListener('keydown', handleKeydown) // 使用命名函数
 
   setEventCallback((eventPayload) => {
-    if (isConnected.value) {
+    // 只有非游客 (登录用户) 且已连接时，才发送广播
+    // 游客虽然连接了 Socket，但这里不执行 emit，所以不会影响别人
+    if (!isGuest.value && isConnected.value) {
       socket.emit('draw', { roomId: store.boardId, ...eventPayload })
     }
     autoSave()

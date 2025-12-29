@@ -79,8 +79,12 @@
             <el-icon><Plus /></el-icon>
           </el-button>
         </el-tooltip>
-        <el-tooltip content="保存到云端" placement="bottom" :hide-after="0">
-          <el-button @click="$emit('save')" :loading="isBusy">
+        <!-- 保存按钮：如果是游客，点击弹出登录提示 -->
+        <el-tooltip
+          :content="userStore.token ? '保存到云端' : '保存到云端 (需登录)'"
+          placement="bottom"
+        >
+          <el-button @click="handleSaveClick" :loading="isBusy">
             <el-icon><Upload /></el-icon>
           </el-button>
         </el-tooltip>
@@ -97,14 +101,19 @@
       </el-button-group>
 
       <!-- 分享按钮 -->
-      <el-button
-        type="success"
-        plain
-        @click="$emit('copy-link')"
-        style="margin-left: 8px"
+      <el-tooltip
+        :content="userStore.token ? '分享链接' : '分享链接 (需登录)'"
+        placement="bottom"
       >
-        <el-icon style="margin-right: 4px"><Share /></el-icon> 分享
-      </el-button>
+        <el-button
+          type="success"
+          plain
+          @click="handleShareClick"
+          style="margin-left: 8px"
+        >
+          <el-icon style="margin-right: 4px"><Share /></el-icon> 分享
+        </el-button>
+      </el-tooltip>
 
       <!-- 状态展示区 (右侧) -->
       <div class="toolbar-right">
@@ -137,12 +146,93 @@
             </el-button>
           </template>
         </el-popconfirm>
+
+        <!-- 用户头像与下拉菜单 (已登录) -->
+        <el-dropdown
+          v-if="userStore.token"
+          trigger="click"
+          @command="handleUserCommand"
+        >
+          <div class="user-profile">
+            <el-avatar :size="32" :style="{ backgroundColor: '#409eff' }">
+              {{ userInitial }}
+            </el-avatar>
+            <span class="username">{{
+              userStore.userInfo?.username || 'User'
+            }}</span>
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </div>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="my-boards" :icon="List">
+                我的画板
+              </el-dropdown-item>
+              <el-dropdown-item command="logout" :icon="SwitchButton">
+                退出账户
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+
+        <!-- 登录按钮 (未登录) -->
+        <el-button v-else type="primary" size="small" @click="handleLogin">
+          登录
+        </el-button>
       </div>
     </el-card>
+    <!-- 历史画板列表弹窗 -->
+    <el-dialog
+      v-model="showHistoryDialog"
+      title="我的画板"
+      width="500px"
+      align-center
+    >
+      <div v-loading="loadingHistory" class="history-list">
+        <el-empty
+          v-if="!historyList.length && !loadingHistory"
+          description="暂无历史画板"
+        />
+
+        <div
+          v-for="board in historyList"
+          :key="board.id"
+          class="history-item"
+          @click="handleOpenBoard(board.id)"
+        >
+          <div class="history-info">
+            <span class="history-id">ID: {{ board.id }}</span>
+            <div class="history-meta">
+              <span class="history-time"
+                >更新时间：{{ formatDate(board.updated_at) }}</span
+              >
+              <span class="history-time"
+                >创建时间：{{ formatDate(board.created_at) }}</span
+              >
+            </div>
+          </div>
+          <div
+            class="history-actions"
+            style="display: flex; align-items: center; gap: 8px"
+          >
+            <el-button
+              type="danger"
+              link
+              :icon="Delete"
+              @click.stop="handleDeleteBoard(board.id)"
+            />
+            <el-icon><ArrowRight /></el-icon>
+          </div>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
+import { computed, ref } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
+import { useUserStore } from '../stores/userStore'
+import { getUserBoards, deleteBoard } from '../api/board' // 引入 API
 import {
   Pointer,
   EditPen,
@@ -155,9 +245,13 @@ import {
   Share,
   Delete,
   Plus,
+  SwitchButton,
+  List,
+  ArrowRight,
 } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
-defineProps({
+const props = defineProps({
   currentTool: String,
   canUndo: Boolean,
   canRedo: Boolean,
@@ -169,7 +263,7 @@ defineProps({
   boardId: String,
 })
 
-defineEmits([
+const emit = defineEmits([
   'set-tool',
   'undo',
   'redo',
@@ -181,6 +275,115 @@ defineEmits([
   'clear',
   'new-board',
 ])
+
+const userStore = useUserStore()
+const router = useRouter()
+const route = useRoute()
+
+const showHistoryDialog = ref(false)
+const loadingHistory = ref(false)
+const historyList = ref([])
+
+// 获取用户名首字母用于头像显示
+const userInitial = computed(() => {
+  const name = userStore.userInfo?.username || 'U'
+  return name.charAt(0).toUpperCase()
+})
+
+const handleLogin = () => {
+  // 跳转登录页，并带上当前页面的路径，以便登录后跳回
+  router.push(`/login?redirect=${route.fullPath}`)
+}
+
+const handleUserCommand = (command) => {
+  if (command === 'logout') {
+    userStore.logout()
+    ElMessage.success('已退出登录，切换为游客模式')
+  } else if (command === 'my-boards') {
+    // 打开历史记录弹窗
+    showHistoryDialog.value = true
+    fetchHistory()
+  }
+}
+
+const fetchHistory = async () => {
+  loadingHistory.value = true
+  try {
+    const res = await getUserBoards()
+    if (res.data.code === 0) {
+      historyList.value = res.data.data
+    }
+  } catch (err) {
+    ElMessage.error('获取列表失败：' + (err.message || err))
+  } finally {
+    loadingHistory.value = false
+  }
+}
+
+const handleDeleteBoard = (id) => {
+  ElMessageBox.confirm('确定要删除这个画板吗？此操作无法撤销。', '警告', {
+    confirmButtonText: '确定',
+    cancelButtonText: '取消',
+    type: 'warning',
+  })
+    .then(async () => {
+      try {
+        const res = await deleteBoard(id)
+        if (res.data.code === 0) {
+          ElMessage.success('删除成功')
+          // 刷新列表
+          fetchHistory()
+          // 如果删除的是当前画板，可能需要跳转或者提示
+          if (id === props.boardId) {
+            // Optional: redirect to home or new board
+          }
+        } else {
+          ElMessage.error(res.data.message || '删除失败')
+        }
+      } catch (err) {
+        ElMessage.error('删除失败：' + (err.message || err))
+      }
+    })
+    .catch(() => {
+      // cancel
+    })
+}
+
+const handleOpenBoard = (id) => {
+  if (id === props.boardId) {
+    showHistoryDialog.value = false
+    return
+  }
+  // 跳转到对应画板
+  router.push(`/board/${id}`)
+  showHistoryDialog.value = false
+  // 触发刷新逻辑 (因为路由参数变了，组件可能复用，需要通知父组件重新加载)
+}
+
+const formatDate = (isoString) => {
+  if (!isoString) return ''
+  return new Date(isoString).toLocaleString()
+}
+
+const handleSaveClick = () => {
+  if (!userStore.token) {
+    ElMessage.warning('游客模式无法保存，请先登录')
+    // 跳转登录页
+    router.push(`/login?redirect=${route.fullPath}`)
+    return
+  }
+  emit('save')
+}
+
+const handleShareClick = () => {
+  if (!userStore.token) {
+    ElMessage.warning('游客模式无法分享，请先登录')
+    // 跳转登录页
+    router.push(`/login?redirect=${route.fullPath}`)
+    return
+  }
+  emit('copy-link')
+}
 </script>
 
 <style scoped>
@@ -204,6 +407,69 @@ defineEmits([
   font-family: monospace;
   margin: 0 8px;
   white-space: nowrap;
+}
+/* --- 用户资料区域 --- */
+.user-profile {
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: background-color 0.2s;
+}
+
+.user-profile:hover {
+  background-color: #f5f7fa;
+}
+
+.username {
+  margin-left: 8px;
+  font-size: 14px;
+  color: #606266;
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid #f0f0f0;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.history-item:hover {
+  background-color: #f5f7fa;
+}
+
+.history-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-id {
+  font-weight: bold;
+  color: #333;
+}
+
+.history-time {
+  font-size: 12px;
+  color: #999;
+}
+.history-meta {
+  display: flex;
+  gap: 16px; /* 两个时间之间的间距 */
+  flex-wrap: wrap; /* 空间不足时自动换行 */
 }
 
 /* --- 移动端适配 --- */
@@ -242,6 +508,18 @@ defineEmits([
 
   .el-button-group {
     flex-shrink: 0;
+  }
+  /* 移动端隐藏用户名，只显示头像 */
+  .username {
+    display: none;
+  }
+
+  .user-profile {
+    padding: 0;
+  }
+
+  .user-profile .el-icon--right {
+    display: none;
   }
 }
 </style>

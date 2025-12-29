@@ -1,5 +1,6 @@
 import { ref, markRaw, onUnmounted } from 'vue'
 import { fabric } from 'fabric'
+import { quadtree } from 'd3-quadtree'
 
 // 解决 Canvas2D 性能警告
 // 劫持 Fabric 内部创建 Canvas 的工具方法
@@ -34,6 +35,10 @@ export function useCanvas() {
   let lastPointer = null
   // 批量操作锁：防止批量删除时触发多次 saveHistory
   let isBatchOperation = false
+
+  // 四叉树优化
+  let objectQuadtree = null
+  let maxObjectRadius = 0
 
   const generateId = () => {
     return 'obj_' + Math.random().toString(36).substring(2, 9)
@@ -113,12 +118,34 @@ export function useCanvas() {
         erasingCandidates.clear()
         // 记录起始点
         lastPointer = c.getPointer(e.e)
+
+        // --- 构建四叉树 ---
+        const objects = c.getObjects()
+        maxObjectRadius = 0
+        const data = objects.map((obj) => {
+          const center = obj.getCenterPoint()
+          // 计算物体最大半径 (包围盒对角线的一半)
+          const br = obj.getBoundingRect()
+          const radius = Math.hypot(br.width, br.height) / 2
+          if (radius > maxObjectRadius) maxObjectRadius = radius
+          return {
+            x: center.x,
+            y: center.y,
+            obj: obj,
+          }
+        })
+
+        objectQuadtree = quadtree()
+          .x((d) => d.x)
+          .y((d) => d.y)
+          .addAll(data)
       }
     })
     // 鼠标松开
     c.on('mouse:up', () => {
       isMouseDown = false
-      lastPointer = null // [新增] 重置
+      lastPointer = null // 重置
+      objectQuadtree = null // 释放内存
     })
 
     // 2. 鼠标移动：实时检测碰撞
@@ -126,7 +153,6 @@ export function useCanvas() {
       if (!isEraserMode || !c.isDrawingMode || !isMouseDown) return
 
       const pointer = c.getPointer(e.e) // 当前点
-      const objects = c.getObjects()
 
       // 如果没有上一次的位置，就用当前位置代替（相当于原地不动）
       const startPoint = lastPointer || pointer
@@ -139,8 +165,35 @@ export function useCanvas() {
         p2: new fabric.Point(endPoint.x, endPoint.y),
       }
 
-      for (let i = objects.length - 1; i >= 0; i--) {
-        const obj = objects[i]
+      // --- 四叉树区域搜索 ---
+      // 1. 计算搜索包围盒 (鼠标轨迹 + 橡皮擦半径 + 物体最大半径)
+      const eraserRadius = c.freeDrawingBrush.width / 2
+      const searchPadding = eraserRadius + maxObjectRadius
+      const minX = Math.min(startPoint.x, endPoint.x) - searchPadding
+      const minY = Math.min(startPoint.y, endPoint.y) - searchPadding
+      const maxX = Math.max(startPoint.x, endPoint.x) + searchPadding
+      const maxY = Math.max(startPoint.y, endPoint.y) + searchPadding
+
+      const candidates = []
+      if (objectQuadtree) {
+        objectQuadtree.visit((node, x1, y1, x2, y2) => {
+          if (!node.length) {
+            do {
+              const d = node.data
+              // 检查点 d 是否在搜索范围内
+              if (d.x >= minX && d.x < maxX && d.y >= minY && d.y < maxY) {
+                candidates.push(d.obj)
+              }
+            } while ((node = node.next))
+          }
+          // 如果当前四叉树节点范围与搜索范围不相交，停止遍历该分支
+          return x1 >= maxX || y1 >= maxY || x2 < minX || y2 < minY
+        })
+      }
+
+      // 遍历候选物体 (数量远小于 objects.length)
+      for (let i = candidates.length - 1; i >= 0; i--) {
+        const obj = candidates[i]
         if (erasingCandidates.has(obj)) continue
 
         // 方案 A: 包围盒检测
@@ -160,7 +213,7 @@ export function useCanvas() {
         if (hitBox || hitLine) {
           // 多点采样像素检测
           // 解决矛盾：
-          // - 必须用像素检测 (isTargetTransparent) 才能防止交叉线误删。
+          // - 必须用像素检测才能防止误删。
           // - 必须在轨迹上多测几个点，才能防止快速移动时漏掉细线。
 
           // 计算鼠标移动距离
@@ -169,7 +222,7 @@ export function useCanvas() {
             endPoint.y - startPoint.y,
           )
           // 设定采样步长：每 5px 测一次 (越小越精准，但性能开销大；5px 是个很好的平衡点)
-          const stepSize = 5
+          const stepSize = 4
           const steps = Math.max(1, Math.floor(dist / stepSize))
 
           let hasInk = false
@@ -424,10 +477,20 @@ export function useCanvas() {
     if (!canvas.value) return
     const obj = canvas.value.getActiveObject()
     if (obj) {
-      canvas.value.remove(obj)
-      canvas.value.discardActiveObject()
+      // 如果是多选删除，需要逐个处理
+      if (obj.type === 'activeSelection') {
+        obj.forEachObject((subObj) => {
+          canvas.value.remove(subObj)
+          emitEvent('remove', { id: subObj.id })
+        })
+        canvas.value.discardActiveObject()
+      } else {
+        canvas.value.remove(obj)
+        emitEvent('remove', { id: obj.id })
+      }
       activeObject.value = null
       canvas.value.requestRenderAll()
+      saveHistory()
     }
   }
 
