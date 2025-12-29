@@ -89,8 +89,19 @@ router.get('/api/board/:id', async (ctx) => {
     const access = checkBoardAccess(board, password)
 
     if (!access.allowed) {
-      ctx.body = { code: 403, error: access.reason, message: 'Access denied' }
-      return
+      // 如果是过期（expired），但当前请求携带的 Token 是该白板 owner，则允许访问
+      const requesterId = ctx.state.user ? Number(ctx.state.user.id) : null
+      const ownerId = board.owner_id ? Number(board.owner_id) : null
+
+      if (
+        access.reason === 'expired' &&
+        requesterId &&
+        ownerId &&
+        requesterId !== ownerId
+      ) {
+        ctx.body = { code: 403, error: access.reason, message: 'Access denied' }
+        return
+      }
     }
 
     // 解析 JSON (数据库存的是字符串)

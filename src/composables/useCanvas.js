@@ -12,6 +12,20 @@ fabric.util.createCanvasElement = function () {
   return canvas
 }
 
+// 节流函数工具
+function throttle(func, limit) {
+  let inThrottle
+  return function () {
+    const args = arguments
+    const context = this
+    if (!inThrottle) {
+      func.apply(context, args)
+      inThrottle = true
+      setTimeout(() => (inThrottle = false), limit)
+    }
+  }
+}
+
 export function useCanvas() {
   const canvas = ref(null)
   const activeObject = ref(null)
@@ -35,6 +49,10 @@ export function useCanvas() {
   let lastPointer = null
   // 批量操作锁：防止批量删除时触发多次 saveHistory
   let isBatchOperation = false
+
+  // 实时绘图相关状态
+  const remoteDrawingPaths = {} // 存储其他用户正在绘制的临时路径
+  let currentDrawId = null // 当前用户正在绘制的路径ID
 
   // 四叉树优化
   let objectQuadtree = null
@@ -109,16 +127,35 @@ export function useCanvas() {
       activeObject.value = null
     })
 
+    // --- 实时移动同步 (节流) ---
+    // 监听物体移动、缩放、旋转过程中的变化
+    // 使用 throttle 限制发送频率，减少网络压力
+    const handleRealtimeModify = throttle((e) => {
+      // 如果正在接收远程更新，或者是橡皮擦操作，不发送
+      if (isReceivingRemote || isBatchOperation) return
+      const target = e.target
+      if (!target) return
+
+      // 发送 'moving' 事件，包含当前物体的状态
+      // 注意：这里我们不保存历史记录，只为了视觉同步
+      emitEvent('moving', target.toJSON(['id']))
+    }, 30) // 约 30fps
+
+    c.on('object:moving', handleRealtimeModify)
+    c.on('object:scaling', handleRealtimeModify)
+    c.on('object:rotating', handleRealtimeModify)
+
     // --- 橡皮擦逻辑：触碰变淡，松手删除 ---
 
     // 1. 鼠标按下：如果是橡皮擦模式，清空待删除列表
     c.on('mouse:down', (e) => {
       isMouseDown = true
+      // 记录起始点
+      const pointer = c.getPointer(e.e)
+
       if (isEraserMode) {
         erasingCandidates.clear()
-        // 记录起始点
-        lastPointer = c.getPointer(e.e)
-
+        lastPointer = pointer
         // --- 构建四叉树 ---
         const objects = c.getObjects()
         maxObjectRadius = 0
@@ -139,6 +176,18 @@ export function useCanvas() {
           .x((d) => d.x)
           .y((d) => d.y)
           .addAll(data)
+      } else if (c.isDrawingMode) {
+        // --- 实时画笔：开始绘制 ---
+        currentDrawId = generateId()
+        // 发送绘制开始信号
+        emitEvent('drawing', {
+          id: currentDrawId,
+          status: 'start',
+          x: pointer.x,
+          y: pointer.y,
+          width: c.freeDrawingBrush.width,
+          color: c.freeDrawingBrush.color,
+        })
       }
     })
     // 鼠标松开
@@ -146,116 +195,142 @@ export function useCanvas() {
       isMouseDown = false
       lastPointer = null // 重置
       objectQuadtree = null // 释放内存
+      // --- 实时画笔：结束绘制 ---
+      if (currentDrawId) {
+        // 发送结束信号 (接收端会移除临时轨迹，等待 path:created 的最终结果)
+        emitEvent('drawing', { id: currentDrawId, status: 'end' })
+        currentDrawId = null
+      }
     })
+
+    // 定义画笔移动的节流函数
+    const handleRealtimeDrawMove = throttle((pointer) => {
+      if (currentDrawId) {
+        emitEvent('drawing', {
+          id: currentDrawId,
+          status: 'move',
+          x: pointer.x,
+          y: pointer.y,
+        })
+      }
+    }, 30)
 
     // 2. 鼠标移动：实时检测碰撞
     c.on('mouse:move', (e) => {
-      if (!isEraserMode || !c.isDrawingMode || !isMouseDown) return
+      // 必须是按下状态
+      if (!isMouseDown) return
 
-      const pointer = c.getPointer(e.e) // 当前点
+      const pointer = c.getPointer(e.e)
 
-      // 如果没有上一次的位置，就用当前位置代替（相当于原地不动）
-      const startPoint = lastPointer || pointer
-      const endPoint = pointer
+      if (isEraserMode && c.isDrawingMode) {
+        // 如果没有上一次的位置，就用当前位置代替（相当于原地不动）
+        const startPoint = lastPointer || pointer
+        const endPoint = pointer
 
-      // 构造鼠标移动的轨迹线段
-      // 注意：这里只是逻辑上的线段，不需要真的画出来
-      const mouseLine = {
-        p1: new fabric.Point(startPoint.x, startPoint.y),
-        p2: new fabric.Point(endPoint.x, endPoint.y),
-      }
-
-      // --- 四叉树区域搜索 ---
-      // 1. 计算搜索包围盒 (鼠标轨迹 + 橡皮擦半径 + 物体最大半径)
-      const eraserRadius = c.freeDrawingBrush.width / 2
-      const searchPadding = eraserRadius + maxObjectRadius
-      const minX = Math.min(startPoint.x, endPoint.x) - searchPadding
-      const minY = Math.min(startPoint.y, endPoint.y) - searchPadding
-      const maxX = Math.max(startPoint.x, endPoint.x) + searchPadding
-      const maxY = Math.max(startPoint.y, endPoint.y) + searchPadding
-
-      const candidates = []
-      if (objectQuadtree) {
-        objectQuadtree.visit((node, x1, y1, x2, y2) => {
-          if (!node.length) {
-            do {
-              const d = node.data
-              // 检查点 d 是否在搜索范围内
-              if (d.x >= minX && d.x < maxX && d.y >= minY && d.y < maxY) {
-                candidates.push(d.obj)
-              }
-            } while ((node = node.next))
-          }
-          // 如果当前四叉树节点范围与搜索范围不相交，停止遍历该分支
-          return x1 >= maxX || y1 >= maxY || x2 < minX || y2 < minY
-        })
-      }
-
-      // 遍历候选物体 (数量远小于 objects.length)
-      for (let i = candidates.length - 1; i >= 0; i--) {
-        const obj = candidates[i]
-        if (erasingCandidates.has(obj)) continue
-
-        // 方案 A: 包围盒检测
-        const hitBox =
-          obj.containsPoint(pointer) || obj.containsPoint(startPoint)
-
-        // 方案 B: 连线相交检测
-        const coords = obj.getCoords()
-        const intersection = fabric.Intersection.intersectLinePolygon(
-          mouseLine.p1,
-          mouseLine.p2,
-          coords,
-        )
-        const hitLine = intersection.status === 'Intersection'
-
-        // 只要满足 A 或 B 任意一个
-        if (hitBox || hitLine) {
-          // 多点采样像素检测
-          // 解决矛盾：
-          // - 必须用像素检测才能防止误删。
-          // - 必须在轨迹上多测几个点，才能防止快速移动时漏掉细线。
-
-          // 计算鼠标移动距离
-          const dist = Math.hypot(
-            endPoint.x - startPoint.x,
-            endPoint.y - startPoint.y,
-          )
-          // 设定采样步长：每 5px 测一次 (越小越精准，但性能开销大；5px 是个很好的平衡点)
-          const stepSize = 4
-          const steps = Math.max(1, Math.floor(dist / stepSize))
-
-          let hasInk = false
-
-          // 沿鼠标轨迹进行采样
-          for (let j = 0; j <= steps; j++) {
-            const t = j / steps
-            // 线性插值计算采样点坐标
-            const x = startPoint.x + (endPoint.x - startPoint.x) * t
-            const y = startPoint.y + (endPoint.y - startPoint.y) * t
-
-            // 只要有一个采样点不是透明的（碰到了墨水），就说明命中
-            if (!c.isTargetTransparent(obj, x, y)) {
-              hasInk = true
-              break // 找到一个点就够了，不用测完
-            }
-          }
-
-          // 如果整条轨迹都在透明区域（比如交叉线的空隙里），则跳过，不删除
-          if (!hasInk) continue
-
-          // 命中！
-          obj.set('opacity', 0.3)
-          obj.dirty = true
-          erasingCandidates.add(obj)
-          c.requestRenderAll()
-
-          // 允许一次鼠标移动删除多条重叠或相邻的线
+        // 构造鼠标移动的轨迹线段
+        // 注意：这里只是逻辑上的线段，不需要真的画出来
+        const mouseLine = {
+          p1: new fabric.Point(startPoint.x, startPoint.y),
+          p2: new fabric.Point(endPoint.x, endPoint.y),
         }
-      }
 
-      // 更新上一次的位置，为下一帧做准备
-      lastPointer = pointer
+        // --- 四叉树区域搜索 ---
+        // 1. 计算搜索包围盒 (鼠标轨迹 + 橡皮擦半径 + 物体最大半径)
+        const eraserRadius = c.freeDrawingBrush.width / 2
+        const searchPadding = eraserRadius + maxObjectRadius
+        const minX = Math.min(startPoint.x, endPoint.x) - searchPadding
+        const minY = Math.min(startPoint.y, endPoint.y) - searchPadding
+        const maxX = Math.max(startPoint.x, endPoint.x) + searchPadding
+        const maxY = Math.max(startPoint.y, endPoint.y) + searchPadding
+
+        const candidates = []
+        if (objectQuadtree) {
+          objectQuadtree.visit((node, x1, y1, x2, y2) => {
+            if (!node.length) {
+              do {
+                const d = node.data
+                // 检查点 d 是否在搜索范围内
+                if (d.x >= minX && d.x < maxX && d.y >= minY && d.y < maxY) {
+                  candidates.push(d.obj)
+                }
+              } while ((node = node.next))
+            }
+            // 如果当前四叉树节点范围与搜索范围不相交，停止遍历该分支
+            return x1 >= maxX || y1 >= maxY || x2 < minX || y2 < minY
+          })
+        }
+
+        // 遍历候选物体 (数量远小于 objects.length)
+        for (let i = candidates.length - 1; i >= 0; i--) {
+          const obj = candidates[i]
+          if (erasingCandidates.has(obj)) continue
+
+          // 方案 A: 包围盒检测
+          const hitBox =
+            obj.containsPoint(pointer) || obj.containsPoint(startPoint)
+
+          // 方案 B: 连线相交检测
+          const coords = obj.getCoords()
+          const intersection = fabric.Intersection.intersectLinePolygon(
+            mouseLine.p1,
+            mouseLine.p2,
+            coords,
+          )
+          const hitLine = intersection.status === 'Intersection'
+
+          // 只要满足 A 或 B 任意一个
+          if (hitBox || hitLine) {
+            // 多点采样像素检测
+            // 解决矛盾：
+            // - 必须用像素检测才能防止误删。
+            // - 必须在轨迹上多测几个点，才能防止快速移动时漏掉细线。
+
+            // 计算鼠标移动距离
+            const dist = Math.hypot(
+              endPoint.x - startPoint.x,
+              endPoint.y - startPoint.y,
+            )
+            // 设定采样步长：每 5px 测一次 (越小越精准，但性能开销大；5px 是个很好的平衡点)
+            const stepSize = 4
+            const steps = Math.max(1, Math.floor(dist / stepSize))
+
+            let hasInk = false
+
+            // 沿鼠标轨迹进行采样
+            for (let j = 0; j <= steps; j++) {
+              const t = j / steps
+              // 线性插值计算采样点坐标
+              const x = startPoint.x + (endPoint.x - startPoint.x) * t
+              const y = startPoint.y + (endPoint.y - startPoint.y) * t
+
+              // 只要有一个采样点不是透明的（碰到了墨水），就说明命中
+              if (!c.isTargetTransparent(obj, x, y)) {
+                hasInk = true
+                break // 找到一个点就够了，不用测完
+              }
+            }
+
+            // 如果整条轨迹都在透明区域（比如交叉线的空隙里），则跳过，不删除
+            if (!hasInk) continue
+
+            // 命中！
+            obj.set('opacity', 0.3)
+            obj.dirty = true
+            erasingCandidates.add(obj)
+            c.requestRenderAll()
+
+            // 允许一次鼠标移动删除多条重叠或相邻的线
+          }
+        }
+
+        // 更新上一次的位置，为下一帧做准备
+        lastPointer = pointer
+      } else if (c.isDrawingMode && !isEraserMode && currentDrawId) {
+        // --- 实时画笔：移动 ---
+        handleRealtimeDrawMove(pointer)
+        // 更新 lastPointer 供可能的逻辑使用
+        lastPointer = pointer
+      }
     })
 
     // 3. 路径生成结束 (松开鼠标)：执行删除
@@ -376,6 +451,68 @@ export function useCanvas() {
         c.renderAll()
         isReceivingRemote = false
       })
+      return
+    }
+
+    // 处理实时移动 ('moving')
+    if (action === 'moving') {
+      const obj = c.getObjects().find((o) => o.id === data.id)
+      if (obj) {
+        obj.set(data)
+        obj.setCoords()
+        c.requestRenderAll()
+      }
+      isReceivingRemote = false // 立即释放锁
+      return
+    }
+
+    // 处理实时绘图 ('drawing')
+    if (action === 'drawing') {
+      const { id, status, x, y, width, color } = data
+
+      if (status === 'start') {
+        // 创建临时路径
+        const pathData = `M ${x} ${y}`
+        const path = new fabric.Path(pathData, {
+          id: id,
+          fill: null,
+          stroke: color,
+          strokeWidth: width,
+          strokeLineCap: 'round',
+          strokeLineJoin: 'round',
+          objectCaching: false, // 关闭缓存以获得流畅的实时渲染
+          selectable: false,
+          evented: false,
+          originX: 'left',
+          originY: 'top',
+          left: 0,
+          top: 0,
+        })
+        path.pathOffset = { x: 0, y: 0 }
+
+        c.add(path)
+        remoteDrawingPaths[id] = path
+      } else if (status === 'move') {
+        const path = remoteDrawingPaths[id]
+        if (path) {
+          // 向路径添加点
+          path.path.push(['L', x, y])
+          // 不再重新计算 Dimensions 和 Center
+          // 直接标记 dirty，因为我们使用的是绝对坐标 + 0偏移
+          path.set({ dirty: true })
+          c.requestRenderAll()
+        }
+      } else if (status === 'end') {
+        // 结束绘制，移除临时路径
+        // 稍后会收到 'add' 事件来添加最终的平滑路径
+        const path = remoteDrawingPaths[id]
+        if (path) {
+          c.remove(path)
+          delete remoteDrawingPaths[id]
+          c.requestRenderAll()
+        }
+      }
+      isReceivingRemote = false
       return
     }
 
