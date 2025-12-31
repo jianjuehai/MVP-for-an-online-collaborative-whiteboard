@@ -363,6 +363,53 @@ app.use(async (ctx) => {
   }
 })
 
+// 将增删改操作应用到数据库中保存的 board.data（只同步对象级变更）
+async function applyDeltaToBoard(roomId, action, data) {
+  try {
+    const rows = await query('SELECT data FROM boards WHERE id = ?', [roomId])
+    let boardData =
+      rows[0] && rows[0].data ? JSON.parse(rows[0].data) : { objects: [] }
+
+    if (!boardData || typeof boardData !== 'object') boardData = { objects: [] }
+    if (!Array.isArray(boardData.objects))
+      boardData.objects = boardData.objects ? boardData.objects : []
+
+    if (action === 'add') {
+      // 避免重复添加
+      if (!boardData.objects.find((o) => o.id === data.id)) {
+        boardData.objects.push(data)
+      }
+    } else if (action === 'modify') {
+      const idx = boardData.objects.findIndex((o) => o.id === data.id)
+      if (idx !== -1) {
+        // 合并修改字段，保留未修改字段
+        boardData.objects[idx] = { ...boardData.objects[idx], ...data }
+      } else {
+        // 如果没有找到，作为回退：追加
+        boardData.objects.push(data)
+      }
+    } else if (action === 'remove') {
+      const removeId = data && data.id ? data.id : data
+      boardData.objects = boardData.objects.filter((o) => o.id !== removeId)
+    } else if (action === 'refresh') {
+      // refresh 可以替换为完整数据（慎用）
+      boardData = data || { objects: [] }
+    } else {
+      // 其它动作（moving/drawing 等）不持久化对象形态
+      return
+    }
+
+    const now = new Date()
+    const sql = `
+      INSERT INTO boards (id, data, updated_at)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE data = VALUES(data), updated_at = VALUES(updated_at)
+    `
+    await query(sql, [roomId, JSON.stringify(boardData), now])
+  } catch (err) {
+    console.error('[applyDeltaToBoard] error:', err)
+  }
+}
 // --- WebSocket 设置 ---
 
 // 1. 创建 HTTP Server，将 Koa 应用作为回调传入
@@ -392,12 +439,21 @@ io.on('connection', (socket) => {
 
   // 核心绘图同步事件
   // Payload 结构: { roomId, action, data, objectId }
-  socket.on('draw', (payload) => {
-    const { roomId } = payload
+  socket.on('draw', async (payload) => {
+    try {
+      const { roomId, action, data } = payload || {}
+      if (!roomId) return
 
-    // 广播给房间内的其他人
-    // 这样发送者不会收到自己发出的消息，天然避免了一部分循环
-    socket.to(roomId).emit('draw', payload)
+      // 广播给房间内的其他人（发送者不会收到自己发的）
+      socket.to(roomId).emit('draw', payload)
+
+      // 仅对增删改/refresh 做持久化（避免把频繁的移动/绘制中间态存库）
+      if (['add', 'modify', 'remove', 'refresh'].includes(action)) {
+        await applyDeltaToBoard(roomId, action, data)
+      }
+    } catch (err) {
+      console.error('[socket draw] error:', err)
+    }
   })
 
   socket.on('disconnect', () => {
