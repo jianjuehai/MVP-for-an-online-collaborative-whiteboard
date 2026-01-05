@@ -11,10 +11,12 @@
     >
       <!-- 工具组 1: 基础工具 -->
       <el-button-group>
+        <!-- 游客模式下禁用选择工具 (防止移动/修改他人图形) -->
         <el-tooltip content="选择模式 (V)" placement="bottom" :hide-after="0">
           <el-button
             :type="currentTool === 'select' ? 'primary' : 'default'"
             @click="$emit('set-tool', 'select')"
+            :disabled="isRestricted"
           >
             <el-icon><Pointer /></el-icon>
           </el-button>
@@ -29,10 +31,12 @@
           </el-button>
         </el-tooltip>
 
+        <!-- 游客模式下禁用橡皮擦 -->
         <el-tooltip content="橡皮擦" placement="bottom" :hide-after="0">
           <el-button
             :type="currentTool === 'eraser' ? 'primary' : 'default'"
             @click="$emit('set-tool', 'eraser')"
+            :disabled="isRestricted"
           >
             🧽
           </el-button>
@@ -40,15 +44,21 @@
       </el-button-group>
       <el-divider direction="vertical" />
 
-      <!-- 工具组 2: 撤销重做 -->
+      <!-- 工具组 2: 撤销重做 (游客禁用，防止撤销他人操作) -->
       <el-button-group>
         <el-tooltip content="撤销 (Ctrl+Z)" placement="bottom" :hide-after="0">
-          <el-button @click="$emit('undo')" :disabled="!canUndo">
+          <el-button
+            @click="$emit('undo')"
+            :disabled="!canUndo || isRestricted"
+          >
             <el-icon><RefreshLeft /></el-icon>
           </el-button>
         </el-tooltip>
         <el-tooltip content="重做 (Ctrl+Y)" placement="bottom" :hide-after="0">
-          <el-button @click="$emit('redo')" :disabled="!canRedo">
+          <el-button
+            @click="$emit('redo')"
+            :disabled="!canRedo || isRestricted"
+          >
             <el-icon><RefreshRight /></el-icon>
           </el-button>
         </el-tooltip>
@@ -102,6 +112,7 @@
 
       <!-- 分享按钮 -->
       <el-tooltip
+        v-if="isOwner"
         :content="userStore.token ? '分享链接' : '分享链接 (需登录)'"
         placement="bottom"
       >
@@ -117,6 +128,24 @@
 
       <!-- 状态展示区 (右侧) -->
       <div class="toolbar-right">
+        <el-tag
+          v-if="isRestricted"
+          type="warning"
+          size="small"
+          effect="plain"
+          style="margin-right: 8px"
+        >
+          游客模式：仅可新增，不可修改
+        </el-tag>
+        <el-tag
+          v-else-if="!userStore.token"
+          type="info"
+          size="small"
+          effect="plain"
+          style="margin-right: 8px"
+        >
+          本地模式 (未登录)
+        </el-tag>
         <el-tag
           v-if="statusMessage"
           :type="isError ? 'danger' : 'success'"
@@ -136,12 +165,21 @@
         >
           {{ isConnected ? 'Online' : 'Offline' }}
         </el-tag>
+        <!-- 只显示一组 room-info，根据是否房主切换内容 -->
+        <span class="room-info" v-if="isOwner">ID: {{ boardId }}</span>
+        <span class="room-info" v-else
+          >Owner: {{ boardOwnerName || 'Unknown' }}</span
+        >
 
-        <span class="room-info">ID: {{ boardId }}</span>
-
+        <!-- 游客禁用清空画布 -->
         <el-popconfirm title="确定要清空画布吗？" @confirm="$emit('clear')">
           <template #reference>
-            <el-button type="danger" circle size="small">
+            <el-button
+              type="danger"
+              circle
+              size="small"
+              :disabled="isRestricted"
+            >
               <el-icon><Delete /></el-icon>
             </el-button>
           </template>
@@ -261,6 +299,9 @@ const props = defineProps({
   statusMessage: String,
   isError: Boolean,
   boardId: String,
+  isRestricted: Boolean,
+  boardOwnerId: [Number, String],
+  boardOwnerName: String,
 })
 
 const emit = defineEmits([
@@ -288,6 +329,19 @@ const historyList = ref([])
 const userInitial = computed(() => {
   const name = userStore.userInfo?.username || 'U'
   return name.charAt(0).toUpperCase()
+})
+
+// 判断当前用户是否是房主
+const isOwner = computed(() => {
+  // 如果没有房主信息（比如本地新建未保存），或者是游客自己创建的本地画板，视为房主
+  if (!props.boardOwnerId) return true
+  // 如果已登录，比较 ID
+  if (userStore.userInfo?.id) {
+    return Number(userStore.userInfo.id) === Number(props.boardOwnerId)
+  }
+  // 游客模式下，如果是本地画板，视为房主 (isRestricted 为 false)
+  // 但这里 props.boardOwnerId 只有从后端获取才有，本地画板通常没有 ownerId
+  return false
 })
 
 const handleLogin = () => {
@@ -335,7 +389,7 @@ const handleDeleteBoard = (id) => {
           fetchHistory()
           // 如果删除的是当前画板，可能需要跳转或者提示
           if (id === props.boardId) {
-            // Optional: redirect to home or new board
+            router.push(`/board/${Math.random().toString(36).slice(2, 8)}`)
           }
         } else {
           ElMessage.error(res.data.message || '删除失败')

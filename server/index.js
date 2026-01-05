@@ -76,8 +76,16 @@ router.get('/api/board/:id', async (ctx) => {
   const { password } = ctx.query // 从查询参数获取密码
 
   try {
-    // SQL 查询
-    const rows = await query('SELECT * FROM boards WHERE id = ?', [id])
+    // SQL 查询 (关联用户表获取 owner_username)
+    const rows = await query(
+      `
+      SELECT b.*, u.username as owner_username 
+      FROM boards b 
+      LEFT JOIN users u ON b.owner_id = u.id 
+      WHERE b.id = ?
+    `,
+      [id],
+    )
     const board = rows[0]
 
     // 如果数据库没记录，视为新白板
@@ -106,7 +114,16 @@ router.get('/api/board/:id', async (ctx) => {
 
     // 解析 JSON (数据库存的是字符串)
     const boardData = board.data ? JSON.parse(board.data) : null
-    ctx.body = { code: 0, data: boardData }
+
+    // 返回数据中增加 owner 信息
+    ctx.body = {
+      code: 0,
+      data: boardData,
+      owner: {
+        id: board.owner_id,
+        username: board.owner_username,
+      },
+    }
   } catch (err) {
     console.error('DB Error:', err)
     ctx.status = 500
@@ -126,8 +143,8 @@ router.post('/api/board/:id', authMiddleware, async (ctx) => {
   const { id } = ctx.params
   const boardData = ctx.request.body
 
-  // 获取当前登录用户的 ID (如果没有登录，则是 null)
-  const userId = ctx.state.user ? ctx.state.user.id : null
+  // 获取当前登录用户的 ID
+  const userId = ctx.state.user.id
 
   try {
     const dataStr = JSON.stringify(boardData)
@@ -142,8 +159,9 @@ router.post('/api/board/:id', authMiddleware, async (ctx) => {
       VALUES (?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE 
         data = VALUES(data), 
-        updated_at = VALUES(updated_at)
-        -- 注意：这里不更新 owner_id，只有第一次创建时才写入
+        updated_at = VALUES(updated_at),
+        owner_id = IF(owner_id IS NULL, VALUES(owner_id), owner_id)
+        -- 这里不更新 owner_id，只在 owner_id 为空时写入    
     `
 
     // 参数数组对应：id, data, created_at, updated_at, owner_id
@@ -441,8 +459,35 @@ io.on('connection', (socket) => {
   // Payload 结构: { roomId, action, data, objectId }
   socket.on('draw', async (payload) => {
     try {
-      const { roomId, action, data } = payload || {}
+      const { roomId, action, data, token } = payload || {}
       if (!roomId) return
+
+      let isGuest = true
+      if (token) {
+        try {
+          jwt.verify(token, JWT_SECRET)
+          isGuest = false
+        } catch (e) {
+          // Token 无效，视为游客
+        }
+      }
+
+      // 如果是游客，拦截删除(remove) 和 刷新(refresh/clear) 操作
+      // 允许 add (新增), drawing (实时绘制), modify (修改 - 配合前端允许修改刚画的形状)
+      if (isGuest) {
+        if (
+          action !== 'add' &&
+          action !== 'drawing' &&
+          action !== 'modify' &&
+          action !== 'moving'
+        ) {
+          // 拒绝广播，也拒绝持久化
+          console.log(
+            `[Security] Blocked unauthorized action '${action}' from guest.`,
+          )
+          return
+        }
+      }
 
       // 广播给房间内的其他人（发送者不会收到自己发的）
       socket.to(roomId).emit('draw', payload)

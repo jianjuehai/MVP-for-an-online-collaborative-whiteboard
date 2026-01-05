@@ -31,12 +31,16 @@ export function useCanvas() {
   const activeObject = ref(null)
   let isReceivingRemote = false
   let onEventCallback = null
+  // 错误/提示回调
+  let onErrorCallback = null
 
   // 历史记录相关
   const historyStack = ref([])
   const redoStack = ref([])
   let isUndoRedoing = false
   const MAX_HISTORY = 50
+  // 记录修改前的状态 (用于 modify 操作的撤销)
+  let modifyStartJSON = null
 
   // 橡皮擦待删除列表
   // 使用 Set 防止重复添加同一个物体
@@ -62,14 +66,16 @@ export function useCanvas() {
     return 'obj_' + Math.random().toString(36).substring(2, 9)
   }
 
-  const saveHistory = () => {
-    if (!canvas.value || isUndoRedoing || isReceivingRemote) return
-    const json = canvas.value.toJSON(['id'])
+  // 添加命令，用于undo/redo
+  const addCommand = (cmd) => {
+    // 如果正在接收远程同步，或者正在执行撤销重做，不记录历史
+    if (isReceivingRemote || isUndoRedoing) return
+
     if (historyStack.value.length >= MAX_HISTORY) {
       historyStack.value.shift()
     }
-    historyStack.value.push(json)
-    redoStack.value = []
+    historyStack.value.push(cmd)
+    redoStack.value = [] // 新操作清空重做栈
   }
 
   const initCanvas = (canvasId) => {
@@ -99,7 +105,10 @@ export function useCanvas() {
     // 启动响应式监听
     window.addEventListener('resize', resizeCanvas)
     resizeCanvas() // 初始化执行一次
-    saveHistory()
+    // 记录初始状态到撤销栈
+    if (!isReceivingRemote && !isUndoRedoing) {
+      addCommand({ type: 'init', data: c.toJSON(['id']) })
+    }
     return c
   }
 
@@ -152,6 +161,11 @@ export function useCanvas() {
       isMouseDown = true
       // 记录起始点
       const pointer = c.getPointer(e.e)
+
+      // 如果点击了物体，记录当前状态作为 "before" 状态
+      if (e.target && !isEraserMode && !c.isDrawingMode) {
+        modifyStartJSON = e.target.toJSON(['id'])
+      }
 
       if (isEraserMode) {
         erasingCandidates.clear()
@@ -348,12 +362,19 @@ export function useCanvas() {
 
         // B. 删除所有被标记的物体
         if (erasingCandidates.size > 0) {
+          // 橡皮擦批量删除记录历史 (一次性记录)
+          const removedData = []
           erasingCandidates.forEach((obj) => {
+            obj.set('opacity', 1)
+            obj.dirty = true
+            removedData.push(obj.toJSON(['id'])) // 记录被删对象详情
             // (这也会触发 object:removed，同样被拦截)
             c.remove(obj)
             // 通知服务器移除 (Socket 消息还是要发的)
             emitEvent('remove', { id: obj.id })
           })
+          //保存一次性删除命令
+          addCommand({ type: 'batch-remove', data: removedData })
 
           // 清空列表
           erasingCandidates.clear()
@@ -361,9 +382,6 @@ export function useCanvas() {
 
           // 2. 解锁
           isBatchOperation = false
-
-          // 3. 手动保存一次最终状态
-          saveHistory()
         } else {
           // 如果没删掉任何东西，也要记得解锁
           isBatchOperation = false
@@ -376,17 +394,40 @@ export function useCanvas() {
       path.set('id', generateId())
       const json = path.toJSON(['id'])
       emitEvent('add', json)
-      saveHistory()
+      addCommand({ type: 'add', data: json })
     })
 
-    // 监听修改并通知外部 + 保存历史
+    // 通用 Action 处理改为命令模式
     const handleAction = (action, e) => {
       if (isReceivingRemote || isBatchOperation) return
       if (!e.target) return
-
       const json = e.target.toJSON(['id'])
+
+      // 同步消息
       emitEvent(action, json)
-      saveHistory()
+
+      // 记录历史 (如果不是正在 Undo/Redo)
+      if (!isUndoRedoing) {
+        if (action === 'add') {
+          // 注意：path:created 已经处理了画笔历史，这里只处理 addShape 等操作
+          // 画笔产生的对象在 object:added 时还没有 ID (在 path:created 才生成)，所以会被这里的 !e.target.id 拦截
+          // 只有 addShape 产生的对象在这里记录
+          addCommand({ type: 'add', data: json })
+        } else if (action === 'remove') {
+          addCommand({ type: 'remove', data: json })
+        } else if (action === 'modify') {
+          if (modifyStartJSON) {
+            addCommand({
+              type: 'modify',
+              id: json.id,
+              before: modifyStartJSON,
+              after: json,
+            })
+            // 更新起始状态，以防连续修改
+            modifyStartJSON = json
+          }
+        }
+      }
     }
 
     c.on('object:modified', (e) => handleAction('modify', e))
@@ -407,37 +448,205 @@ export function useCanvas() {
   }
 
   // --- Undo / Redo ---
+
+  // 辅助：按 id 查找
+  const findById = (c, id) => c.getObjects().find((o) => o.id === id)
+
+  // 判断撤回是否可生效（当前画布状态下）
+  const isApplicableForUndo = (cmd, c) => {
+    switch (cmd.type) {
+      case 'add': // 撤销添加 = 删除该对象，只有对象还在时才有意义
+        return !!findById(c, cmd.data.id)
+      case 'remove': // 撤销删除 = 恢复对象，只有对象当前不在时才有意义
+        return !findById(c, cmd.data.id)
+      case 'modify': // 撤销修改 = 恢复前态，只有对象存在才有意义
+        return !!findById(c, cmd.id)
+      case 'batch-remove': // 撤销批量删除 = 批量恢复，至少有一个缺失才有意义
+        return cmd.data.some((item) => !findById(c, item.id))
+      case 'clear': // 撤销清空 = 批量恢复，总是可尝试；内部做去重
+        return true
+      default:
+        return true
+    }
+  }
+
+  // 判断重做是否可生效
+  const isApplicableForRedo = (cmd, c) => {
+    switch (cmd.type) {
+      case 'add': // 重做添加 = 添加对象，只有对象当前不存在才有意义
+        return !findById(c, cmd.data.id)
+      case 'remove': // 重做删除 = 删除对象，只有对象当前存在才有意义
+        return !!findById(c, cmd.data.id)
+      case 'modify': // 重做修改 = 应用后态，只有对象存在才有意义
+        return !!findById(c, cmd.id)
+      case 'batch-remove': // 重做批量删除 = 批量删除，至少有一个当前存在才有意义
+        return cmd.data.some((item) => !!findById(c, item.id))
+      case 'clear':
+        return true
+      default:
+        return true
+    }
+  }
+
   const undo = () => {
-    if (historyStack.value.length < 2 || !canvas.value) return
+    if (!canvas.value || historyStack.value.length === 0) return
+    const c = canvas.value
     isUndoRedoing = true
-    const currentState = historyStack.value.pop()
-    redoStack.value.push(currentState)
-    const prevState = historyStack.value[historyStack.value.length - 1]
-    canvas.value.loadFromJSON(prevState, () => {
-      canvas.value.renderAll()
-      isUndoRedoing = false
-      if (onEventCallback) {
-        onEventCallback({ action: 'refresh', data: prevState })
+
+    let skipped = 0
+    let cmd = null
+
+    // 向后查找“当前仍可生效的最近一次操作”
+    while (historyStack.value.length) {
+      const top = historyStack.value.pop()
+      if (isApplicableForUndo(top, c)) {
+        cmd = top
+        break
       }
-    })
+      skipped++
+      // 跳过的失效记录不进入 redoStack
+    }
+
+    if (!cmd) {
+      isUndoRedoing = false
+      if (skipped && onErrorCallback)
+        onErrorCallback('部分操作因对象已被删除，已自动跳过')
+      return
+    }
+
+    // 仅对生效的这条操作入 redo 栈
+    redoStack.value.push(cmd)
+
+    const onComplete = () => {
+      isUndoRedoing = false
+      if (skipped && onErrorCallback)
+        onErrorCallback('部分操作因对象已被删除，已自动跳过')
+    }
+
+    if (cmd.type === 'add') {
+      const obj = findById(c, cmd.data.id)
+      if (obj) {
+        c.remove(obj)
+        c.requestRenderAll()
+      }
+      onComplete()
+    } else if (cmd.type === 'remove') {
+      const payload = [cmd.data].filter((item) => !findById(c, item.id))
+      fabric.util.enlivenObjects(payload, (objs) => {
+        objs.forEach((o) => c.add(o))
+        c.requestRenderAll()
+        onComplete()
+      })
+    } else if (cmd.type === 'modify') {
+      const obj = findById(c, cmd.id)
+      if (obj) {
+        obj.set(cmd.before)
+        obj.setCoords()
+        c.requestRenderAll()
+        emitEvent('modify', obj.toJSON(['id']))
+      }
+      onComplete()
+    } else if (cmd.type === 'batch-remove') {
+      const payload = cmd.data.filter((item) => !findById(c, item.id))
+      fabric.util.enlivenObjects(payload, (objs) => {
+        objs.forEach((o) => c.add(o))
+        c.requestRenderAll()
+        onComplete()
+      })
+    } else if (cmd.type === 'clear') {
+      const payload = cmd.data.filter((item) => !findById(c, item.id))
+      fabric.util.enlivenObjects(payload, (objs) => {
+        objs.forEach((o) => c.add(o))
+        c.backgroundColor = '#ffffff'
+        c.requestRenderAll()
+        onComplete()
+      })
+    } else {
+      onComplete()
+    }
   }
 
   const redo = () => {
-    if (redoStack.value.length === 0 || !canvas.value) return
+    if (!canvas.value || redoStack.value.length === 0) return
+    const c = canvas.value
     isUndoRedoing = true
-    const nextState = redoStack.value.pop()
-    historyStack.value.push(nextState)
-    canvas.value.loadFromJSON(nextState, () => {
-      canvas.value.renderAll()
-      isUndoRedoing = false
-      if (onEventCallback) {
-        onEventCallback({ action: 'refresh', data: nextState })
+
+    let skipped = 0
+    let cmd = null
+
+    // 向后查找“当前仍可生效的最近一次重做”
+    while (redoStack.value.length) {
+      const top = redoStack.value.pop()
+      if (isApplicableForRedo(top, c)) {
+        cmd = top
+        break
       }
-    })
+      skipped++
+      // 跳过的失效记录不回填到 historyStack
+    }
+
+    if (!cmd) {
+      isUndoRedoing = false
+      if (skipped && onErrorCallback)
+        onErrorCallback('部分操作因对象已被删除，已自动跳过')
+      return
+    }
+
+    // 仅回填生效的这条操作到历史栈
+    historyStack.value.push(cmd)
+
+    const onComplete = () => {
+      isUndoRedoing = false
+      if (skipped && onErrorCallback)
+        onErrorCallback('部分操作因对象已被删除，已自动跳过')
+    }
+
+    if (cmd.type === 'add') {
+      const payload = [cmd.data].filter((item) => !findById(c, item.id))
+      fabric.util.enlivenObjects(payload, (objs) => {
+        objs.forEach((o) => c.add(o))
+        c.requestRenderAll()
+        onComplete()
+      })
+    } else if (cmd.type === 'remove') {
+      const obj = findById(c, cmd.data.id)
+      if (obj) c.remove(obj)
+      c.requestRenderAll()
+      onComplete()
+    } else if (cmd.type === 'modify') {
+      const obj = findById(c, cmd.id)
+      if (obj) {
+        obj.set(cmd.after)
+        obj.setCoords()
+        c.requestRenderAll()
+        emitEvent('modify', obj.toJSON(['id']))
+      }
+      onComplete()
+    } else if (cmd.type === 'batch-remove') {
+      cmd.data.forEach((item) => {
+        const obj = findById(c, item.id)
+        if (obj) c.remove(obj)
+      })
+      c.requestRenderAll()
+      onComplete()
+    } else if (cmd.type === 'clear') {
+      c.clear()
+      c.backgroundColor = '#ffffff'
+      c.requestRenderAll()
+      // 同步清空（逐个发 remove）
+      cmd.data.forEach((item) => emitEvent('remove', { id: item.id }))
+      onComplete()
+    } else {
+      onComplete()
+    }
   }
 
   const setEventCallback = (fn) => {
     onEventCallback = fn
+  }
+  // 暴露设置错误回调的方法
+  const setOnError = (fn) => {
+    onErrorCallback = fn
   }
 
   const applyRemoteUpdate = (payload) => {
@@ -627,24 +836,105 @@ export function useCanvas() {
       }
       activeObject.value = null
       canvas.value.requestRenderAll()
-      saveHistory()
     }
   }
 
   const clearCanvas = () => {
     if (!canvas.value) return
+    const allObjs = canvas.value.getObjects().map((o) => o.toJSON(['id']))
+
+    // 记录 clear 命令
+    if (allObjs.length > 0 && !isReceivingRemote && !isUndoRedoing) {
+      addCommand({ type: 'clear', data: allObjs })
+    }
+
+    isBatchOperation = true
     canvas.value.clear()
     canvas.value.backgroundColor = '#ffffff'
     activeObject.value = null
+    isBatchOperation = false
+
+    // 遍历发送删除信号以同步
+    allObjs.forEach((o) => emitEvent('remove', { id: o.id }))
+  }
+
+  // 属性编辑会话：只在关闭面板时入栈一次
+  let attrEditSession = null // { id, before }
+
+  const beginAttributeEdit = (objectId) => {
+    if (!canvas.value || !objectId) return
+    const c = canvas.value
+    const obj = c.getObjects().find((o) => o.id === objectId)
+    if (!obj) return
+    // 记录会话起始快照
+    attrEditSession = {
+      id: objectId,
+      before: obj.toJSON(['id']),
+    }
+  }
+
+  // 简单状态比较：序列化后比对
+  const isStateEqual = (a, b) => {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b)
+    } catch {
+      return false
+    }
+  }
+
+  const commitAttributeEdit = () => {
+    if (!canvas.value || !attrEditSession) return
+    const c = canvas.value
+    const obj = c.getObjects().find((o) => o.id === attrEditSession.id)
+    if (!obj) {
+      // 对象不存在，直接结束会话
+      attrEditSession = null
+      return
+    }
+    const after = obj.toJSON(['id'])
+    // 如果正在接收远端或撤回中，避免入栈
+    if (
+      !isReceivingRemote &&
+      !isUndoRedoing &&
+      !isStateEqual(attrEditSession.before, after)
+    ) {
+      addCommand({
+        type: 'modify',
+        id: obj.id,
+        before: attrEditSession.before,
+        after,
+      })
+    }
+    attrEditSession = null
   }
 
   const updateActiveObject = (key, value) => {
     const obj = canvas.value?.getActiveObject()
-    if (obj) {
+    if (!obj) return
+
+    // 如果值未变化，直接跳过
+    if (obj.get(key) === value) return
+    // 会话中：只应用与广播，不入历史
+    if (attrEditSession && attrEditSession.id === obj.id) {
       obj.set(key, value)
       canvas.value.requestRenderAll()
-      emitEvent('modify', obj.toJSON(['id']))
+      const after = obj.toJSON(['id'])
+      emitEvent('modify', after)
+      return
     }
+
+    // 非会话：单次修改直接入历史
+    const before = obj.toJSON(['id'])
+    obj.set(key, value)
+    canvas.value.requestRenderAll()
+    const after = obj.toJSON(['id'])
+    emitEvent('modify', after)
+    addCommand({
+      type: 'modify',
+      id: obj.id,
+      before,
+      after,
+    })
   }
 
   const toJSON = () => {
@@ -656,6 +946,11 @@ export function useCanvas() {
     if (!canvas.value || !json) return
     canvas.value.loadFromJSON(json, () => {
       canvas.value.renderAll()
+      // 切换画板时清空撤销/重做栈
+      historyStack.value = []
+      redoStack.value = []
+      // 记录初始状态到撤销栈
+      addCommand({ type: 'init', data: canvas.value.toJSON(['id']) })
     })
   }
 
@@ -683,10 +978,13 @@ export function useCanvas() {
     deleteSelected,
     clearCanvas,
     updateActiveObject,
+    beginAttributeEdit,
+    commitAttributeEdit,
     toJSON,
     loadFromJSON,
     exportAsImage,
     setEventCallback,
+    setOnError,
     applyRemoteUpdate,
     undo,
     redo,

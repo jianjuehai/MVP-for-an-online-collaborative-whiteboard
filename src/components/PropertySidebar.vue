@@ -17,7 +17,7 @@
         </el-form-item>
 
         <div class="form-row">
-          <el-form-item label="填充颜色">
+          <el-form-item label="填充颜色" v-if="supportsFill">
             <el-color-picker
               :model-value="attributes.fill"
               @change="(val) => $emit('update-attribute', 'fill', val)"
@@ -25,7 +25,7 @@
             />
           </el-form-item>
 
-          <el-form-item label="边框颜色">
+          <el-form-item :label="strokeLabel">
             <el-color-picker
               :model-value="attributes.stroke"
               @change="(val) => $emit('update-attribute', 'stroke', val)"
@@ -59,13 +59,42 @@
 </template>
 
 <script setup>
-defineProps({
+import { computed } from 'vue'
+
+const props = defineProps({
   isOpen: Boolean,
   activeObject: Object,
   attributes: Object,
 })
 
 defineEmits(['update-attribute', 'delete', 'close'])
+
+// 线条不支持填充；形状支持
+const supportsFill = computed(() => {
+  const obj = props.activeObject
+  if (!obj) return false
+  const t = obj.type
+  // 将线条和自由绘制路径视为仅描边
+  if (t === 'line' || t === 'path') return false
+  // 典型支持填充的类型
+  return [
+    'rect',
+    'circle',
+    'triangle',
+    'polygon',
+    'ellipse',
+    'textbox',
+    'i-text',
+  ].includes(t)
+})
+
+// 动态切换边框颜色标签
+const strokeLabel = computed(() => {
+  const obj = props.activeObject
+  if (!obj) return '边框颜色'
+  const t = obj.type
+  return t === 'line' || t === 'path' ? '线条颜色' : '边框颜色'
+})
 </script>
 
 <style scoped>
