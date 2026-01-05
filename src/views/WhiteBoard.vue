@@ -14,6 +14,7 @@
       :is-restricted="isRestrictedGuest"
       :board-owner-id="boardOwnerId"
       :board-owner-name="boardOwnerName"
+      :has-active-object="!!activeObject"
       @set-tool="handleSetTool"
       @undo="undo"
       @redo="redo"
@@ -24,6 +25,7 @@
       @copy-link="copyLink"
       @clear="handleClear"
       @new-board="handleNewBoard"
+      @open-sidebar="store.isSidebarOpen = true"
     />
 
     <ShareDialogs
@@ -423,7 +425,7 @@ watch(
 
 watch(activeObject, (newObj) => {
   if (newObj) {
-    store.isSidebarOpen = true
+    // store.isSidebarOpen = true // 改为手动点击按钮打开
     if (newObj.fill) store.attributes.fill = newObj.fill
     if (newObj.stroke) store.attributes.stroke = newObj.stroke
     if (newObj.strokeWidth !== undefined)

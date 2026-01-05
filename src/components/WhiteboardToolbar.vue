@@ -82,6 +82,15 @@
 
       <el-divider direction="vertical" />
 
+      <!-- 属性面板按钮 -->
+      <el-tooltip content="属性面板" placement="bottom" :hide-after="0">
+        <el-button @click="$emit('open-sidebar')" :disabled="!hasActiveObject">
+          <el-icon><Setting /></el-icon>
+        </el-button>
+      </el-tooltip>
+
+      <el-divider direction="vertical" />
+
       <!-- 工具组 4: 保存与操作 -->
       <el-button-group>
         <el-tooltip content="新建白板" placement="bottom" :hide-after="0">
@@ -286,6 +295,7 @@ import {
   SwitchButton,
   List,
   ArrowRight,
+  Setting,
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -302,6 +312,7 @@ const props = defineProps({
   isRestricted: Boolean,
   boardOwnerId: [Number, String],
   boardOwnerName: String,
+  hasActiveObject: Boolean,
 })
 
 const emit = defineEmits([
@@ -315,6 +326,7 @@ const emit = defineEmits([
   'copy-link',
   'clear',
   'new-board',
+  'open-sidebar',
 ])
 
 const userStore = useUserStore()
