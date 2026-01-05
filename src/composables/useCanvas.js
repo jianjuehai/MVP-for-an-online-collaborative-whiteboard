@@ -1,5 +1,7 @@
-import { ref, markRaw, onUnmounted } from 'vue'
+import { ref, markRaw, onUnmounted, watch } from 'vue'
 import { fabric } from 'fabric'
+import { useSocket } from './useSocket'
+import { useBoardStore } from '../stores/boardStore'
 import { quadtree } from 'd3-quadtree'
 
 // 解决 Canvas2D 性能警告
@@ -29,6 +31,8 @@ function throttle(func, limit) {
 export function useCanvas() {
   const canvas = ref(null)
   const activeObject = ref(null)
+  const { remoteLocks, requestLock, releaseLock } = useSocket()
+  const store = useBoardStore()
   let isReceivingRemote = false
   let onEventCallback = null
   // 错误/提示回调
@@ -112,6 +116,46 @@ export function useCanvas() {
     return c
   }
 
+  // 监听远程锁状态变化，更新画布对象状态
+  watch(
+    remoteLocks,
+    (locks) => {
+      if (!canvas.value) return
+      const c = canvas.value
+      c.getObjects().forEach((obj) => {
+        if (locks[obj.id]) {
+          // 被别人锁住了
+          obj.set({
+            lockMovementX: true,
+            lockMovementY: true,
+            lockRotation: true,
+            lockScalingX: true,
+            lockScalingY: true,
+            borderColor: 'red',
+            cornerColor: 'red',
+            cornerStrokeColor: 'red',
+            hasControls: false, // 隐藏控制点
+          })
+        } else {
+          // 解锁 (恢复默认)
+          obj.set({
+            lockMovementX: false,
+            lockMovementY: false,
+            lockRotation: false,
+            lockScalingX: false,
+            lockScalingY: false,
+            borderColor: '#42b883',
+            cornerColor: '#ffffff',
+            cornerStrokeColor: '#42b883',
+            hasControls: true,
+          })
+        }
+      })
+      c.requestRenderAll()
+    },
+    { deep: true },
+  )
+
   // 响应式调整画布大小
   const resizeCanvas = () => {
     if (!canvas.value) return
@@ -159,6 +203,15 @@ export function useCanvas() {
     // 1. 鼠标按下：如果是橡皮擦模式，清空待删除列表
     c.on('mouse:down', (e) => {
       isMouseDown = true
+
+      // --- 锁机制 ---
+      if (e.target && !isEraserMode && !c.isDrawingMode) {
+        // 如果对象没有被远程锁定，尝试获取锁
+        if (!remoteLocks.value[e.target.id]) {
+          requestLock(store.boardId, e.target.id)
+        }
+      }
+
       // 记录起始点
       const pointer = c.getPointer(e.e)
 
@@ -205,8 +258,14 @@ export function useCanvas() {
       }
     })
     // 鼠标松开
-    c.on('mouse:up', () => {
+    c.on('mouse:up', (e) => {
       isMouseDown = false
+
+      // --- 锁机制 ---
+      if (e.target) {
+        releaseLock(store.boardId, e.target.id)
+      }
+
       lastPointer = null // 重置
       objectQuadtree = null // 释放内存
       // --- 实时画笔：结束绘制 ---

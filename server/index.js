@@ -442,6 +442,8 @@ const io = new Server(server, {
 })
 
 // 3. 监听 Socket 连接事件
+const locks = {} // 全局锁状态
+
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id)
 
@@ -450,9 +452,49 @@ io.on('connection', (socket) => {
     socket.join(roomId) // 将该 socket 加入对应的房间分组
     console.log(`Socket ${socket.id} joined room: ${roomId}`)
 
+    // 发送当前房间的锁状态给新加入的用户
+    const roomLocks = locks[roomId] || {}
+    socket.emit('init-locks', roomLocks)
+
     socket
       .to(roomId)
       .emit('sys_msg', `User ${socket.id.substring(0, 4)} joined the room.`)
+  })
+
+  // --- 对象锁机制 ---
+  socket.on('request-lock', ({ boardId, objectId }) => {
+    if (!locks[boardId]) locks[boardId] = {}
+
+    const currentLock = locks[boardId][objectId]
+
+    // 如果已经被别人锁了 (且不是自己)
+    if (currentLock && currentLock.userId !== socket.id) {
+      // 检查是否超时 (例如 30秒) - 可选
+      if (Date.now() - currentLock.timestamp < 30000) {
+        socket.emit('lock-denied', { objectId, holder: currentLock.userId })
+        return
+      }
+    }
+
+    // 加锁 (或续期)
+    locks[boardId][objectId] = {
+      userId: socket.id,
+      timestamp: Date.now(),
+    }
+
+    socket.emit('lock-acquired', { objectId })
+    // 广播给房间内其他人
+    socket.to(boardId).emit('object-locked', { objectId, userId: socket.id })
+  })
+
+  socket.on('release-lock', ({ boardId, objectId }) => {
+    if (locks[boardId] && locks[boardId][objectId]) {
+      // 只有持有者才能释放
+      if (locks[boardId][objectId].userId === socket.id) {
+        delete locks[boardId][objectId]
+        socket.to(boardId).emit('object-unlocked', { objectId })
+      }
+    }
   })
 
   // 核心绘图同步事件
@@ -503,6 +545,16 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id)
+    // 清理该用户持有的所有锁
+    for (const boardId in locks) {
+      const roomLocks = locks[boardId]
+      for (const objectId in roomLocks) {
+        if (roomLocks[objectId].userId === socket.id) {
+          delete roomLocks[objectId]
+          socket.to(boardId).emit('object-unlocked', { objectId })
+        }
+      }
+    }
   })
 })
 

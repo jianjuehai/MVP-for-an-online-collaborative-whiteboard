@@ -14,6 +14,8 @@ const socket = io(getSocketUrl(), {
 })
 
 const isConnected = ref(false)
+// 远程锁状态: { [objectId]: userId }
+const remoteLocks = ref({})
 
 // --- (全局单例区域) ---
 socket.on('connect', () => {
@@ -23,7 +25,26 @@ socket.on('connect', () => {
 
 socket.on('disconnect', () => {
   isConnected.value = false
+  remoteLocks.value = {} // 断开连接清空锁状态
   console.log('❌ Socket disconnected')
+})
+
+socket.on('init-locks', (locks) => {
+  // locks 结构: { [objectId]: { userId, timestamp } }
+  // 转换为简单的 { [objectId]: userId }
+  const simpleLocks = {}
+  for (const key in locks) {
+    simpleLocks[key] = locks[key].userId
+  }
+  remoteLocks.value = simpleLocks
+})
+
+socket.on('object-locked', ({ objectId, userId }) => {
+  remoteLocks.value[objectId] = userId
+})
+
+socket.on('object-unlocked', ({ objectId }) => {
+  delete remoteLocks.value[objectId]
 })
 
 socket.on('sys_msg', (msg) => {
@@ -45,10 +66,25 @@ export function useSocket() {
     }
   }
 
+  const requestLock = (boardId, objectId) => {
+    if (socket.connected) {
+      socket.emit('request-lock', { boardId, objectId })
+    }
+  }
+
+  const releaseLock = (boardId, objectId) => {
+    if (socket.connected) {
+      socket.emit('release-lock', { boardId, objectId })
+    }
+  }
+
   return {
     socket,
     isConnected,
+    remoteLocks,
     connect,
     joinRoom,
+    requestLock,
+    releaseLock,
   }
 }

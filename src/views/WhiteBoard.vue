@@ -51,9 +51,12 @@
         :is-open="store.isSidebarOpen"
         :active-object="activeObject"
         :attributes="store.attributes"
+        :is-locked="isSidebarLocked"
         @update-attribute="syncAttribute"
         @delete="deleteSelected"
         @close="handleSidebarClose"
+        @focus-attribute="handleAttributeFocus"
+        @blur-attribute="handleAttributeBlur"
       />
     </div>
   </div>
@@ -89,6 +92,12 @@ const isLocalBoard = computed(() => {
 // 只有当是游客，且不是自己创建的画板时，才进行限制
 const isRestrictedGuest = computed(() => isGuest.value && !isLocalBoard.value)
 
+// 侧边栏锁定状态：被远程锁定 或 受限游客
+const isSidebarLocked = computed(() => {
+  if (!activeObject.value) return false
+  return !!remoteLocks.value[activeObject.value.id] || isRestrictedGuest.value
+})
+
 // --- Composables ---
 const {
   canvas,
@@ -113,7 +122,15 @@ const {
   commitAttributeEdit,
 } = useCanvas()
 
-const { socket, isConnected, connect, joinRoom } = useSocket()
+const {
+  socket,
+  isConnected,
+  connect,
+  joinRoom,
+  remoteLocks,
+  requestLock,
+  releaseLock,
+} = useSocket()
 
 // --- 本地状态 (仅保留与 DOM 相关的) ---
 const canvasWrapperRef = ref(null)
@@ -440,9 +457,28 @@ watch(activeObject, (newObj) => {
 })
 
 // 替换侧边栏关闭处理，先提交会话，再关闭
+// 关闭时也确保释放锁 (防止 blur 没触发)
+
+// 替换侧边栏关闭处理，先提交会话，再关闭
 const handleSidebarClose = () => {
   commitAttributeEdit()
   store.isSidebarOpen = false
+  // 关闭时也确保释放锁 (防止 blur 没触发)
+  if (activeObject.value) {
+    releaseLock(store.boardId, activeObject.value.id)
+  }
+}
+
+const handleAttributeFocus = () => {
+  if (activeObject.value) {
+    requestLock(store.boardId, activeObject.value.id)
+  }
+}
+
+const handleAttributeBlur = () => {
+  if (activeObject.value) {
+    releaseLock(store.boardId, activeObject.value.id)
+  }
 }
 
 watch(

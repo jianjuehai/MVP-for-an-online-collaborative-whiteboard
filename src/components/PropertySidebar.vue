@@ -20,7 +20,14 @@
           <el-form-item label="填充颜色" v-if="supportsFill">
             <el-color-picker
               :model-value="attributes.fill"
-              @change="(val) => $emit('update-attribute', 'fill', val)"
+              :disabled="isLocked"
+              @active-change="handleInputStart"
+              @change="
+                (val) => {
+                  $emit('update-attribute', 'fill', val)
+                  handleInputEnd()
+                }
+              "
               show-alpha
             />
           </el-form-item>
@@ -28,7 +35,14 @@
           <el-form-item :label="strokeLabel">
             <el-color-picker
               :model-value="attributes.stroke"
-              @change="(val) => $emit('update-attribute', 'stroke', val)"
+              :disabled="isLocked"
+              @active-change="handleInputStart"
+              @change="
+                (val) => {
+                  $emit('update-attribute', 'stroke', val)
+                  handleInputEnd()
+                }
+              "
               show-alpha
             />
           </el-form-item>
@@ -39,7 +53,14 @@
             :model-value="attributes.strokeWidth"
             :min="2"
             :max="20"
-            @input="(val) => $emit('update-attribute', 'strokeWidth', val)"
+            :disabled="isLocked"
+            @input="
+              (val) => {
+                handleInputStart()
+                $emit('update-attribute', 'strokeWidth', val)
+              }
+            "
+            @change="handleInputEnd"
           />
         </el-form-item>
       </el-form>
@@ -49,6 +70,7 @@
           type="danger"
           plain
           style="width: 100%"
+          :disabled="isLocked"
           @click="$emit('delete')"
         >
           删除选中物体
@@ -59,15 +81,38 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = defineProps({
   isOpen: Boolean,
   activeObject: Object,
   attributes: Object,
+  isLocked: Boolean,
 })
 
-defineEmits(['update-attribute', 'delete', 'close'])
+const emit = defineEmits([
+  'update-attribute',
+  'delete',
+  'close',
+  'focus-attribute',
+  'blur-attribute',
+])
+
+const isEditing = ref(false)
+
+const handleInputStart = () => {
+  if (!isEditing.value) {
+    isEditing.value = true
+    emit('focus-attribute')
+  }
+}
+
+const handleInputEnd = () => {
+  if (isEditing.value) {
+    isEditing.value = false
+    emit('blur-attribute')
+  }
+}
 
 // 线条不支持填充；形状支持
 const supportsFill = computed(() => {
