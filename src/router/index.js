@@ -7,8 +7,8 @@ const routes = [
   {
     path: '/',
     redirect: () => {
-      const randomId = Math.random().toString(36).substring(2, 8)
-      return { path: `/board/${randomId}` }
+      // 游客从根路径访问时，直接跳转到本地白板
+      return { path: '/board/local' }
     },
   },
   {

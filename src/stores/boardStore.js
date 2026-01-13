@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, reactive } from 'vue'
 import { saveBoard } from '../api/board'
 import { useUserStore } from './userStore'
+import { debounce } from '../utils/debounce'
 
 export const useBoardStore = defineStore('board', () => {
   // --- 状态 (State) ---
@@ -27,9 +28,27 @@ export const useBoardStore = defineStore('board', () => {
 
   // --- 动作 (Actions) ---
 
-  const setTool = (tool) => {
+  const setActiveTool = (tool, isRestrictedGuest) => {
+    // 游客限制逻辑移到这里
+    if (isRestrictedGuest && tool !== 'pen') {
+      return { success: false, message: '游客模式仅可使用画笔和添加形状' }
+    }
+
     currentTool.value = tool
+    return { success: true }
   }
+
+  // 封装属性更新
+  const updateAttribute = (key, value) => {
+    attributes[key] = value
+  }
+
+  // 封装自动保存逻辑 (去抖动)
+  // 注意：Store 不直接持有 canvas 数据，需要传入数据闭包或在外部调用 save
+  const triggerAutoSave = debounce(async (jsonData, isRestrictedGuest) => {
+    if (isRestrictedGuest) return
+    await save(jsonData)
+  }, 1000)
 
   const setStatus = (message, error = false) => {
     statusMessage.value = message
@@ -76,7 +95,9 @@ export const useBoardStore = defineStore('board', () => {
     attributes,
     statusMessage,
     isError,
-    setTool,
+    setActiveTool,
+    updateAttribute,
+    triggerAutoSave,
     setStatus,
     save,
   }

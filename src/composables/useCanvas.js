@@ -3,6 +3,7 @@ import { fabric } from 'fabric'
 import { useSocket } from './useSocket'
 import { useBoardStore } from '../stores/boardStore'
 import { quadtree } from 'd3-quadtree'
+import { throttle } from '../utils/debounce'
 
 // 解决 Canvas2D 性能警告
 // 劫持 Fabric 内部创建 Canvas 的工具方法
@@ -12,20 +13,6 @@ fabric.util.createCanvasElement = function () {
   const canvas = originalCreateCanvas.apply(this, arguments)
   canvas.getContext('2d', { willReadFrequently: true })
   return canvas
-}
-
-// 节流函数工具
-function throttle(func, limit) {
-  let inThrottle
-  return function () {
-    const args = arguments
-    const context = this
-    if (!inThrottle) {
-      func.apply(context, args)
-      inThrottle = true
-      setTimeout(() => (inThrottle = false), limit)
-    }
-  }
 }
 
 export function useCanvas() {
